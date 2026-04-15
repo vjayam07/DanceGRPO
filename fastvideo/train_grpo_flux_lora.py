@@ -61,6 +61,7 @@ from PIL import Image
 from diffusers import FluxTransformer2DModel, AutoencoderKL
 from contextlib import contextmanager
 from safetensors.torch import save_file
+from fastvideo.utils.compute_tracker import GRPOComputeTracker
 
 def sd3_time_shift(shift, t):
     return (shift * t) / (1 + (shift - 1) * t)
@@ -566,6 +567,89 @@ def train_one_step(
     return total_loss, grad_norm.item()
 
 
+def calibrate_compute_tracker(tracker, transformer, vae, reward_model, tokenizer,
+                               preprocess_val, device, args):
+    """Measure actual FLOPs for each phase using FlopCounterMode.
+
+    Runs one forward pass of each component with real inputs to calibrate
+    the tracker. Called once before the training loop on rank 0.
+    """
+    from torch.utils.flop_counter import FlopCounterMode
+    SPATIAL_DOWNSAMPLE = 8
+    IN_CHANNELS = 16
+    latent_h = args.h // SPATIAL_DOWNSAMPLE
+    latent_w = args.w // SPATIAL_DOWNSAMPLE
+
+    # Dummy inputs matching actual shapes
+    z = torch.randn(1, IN_CHANNELS, latent_h, latent_w, device=device, dtype=torch.bfloat16)
+    z_packed = pack_latents(z, 1, IN_CHANNELS, latent_h, latent_w)
+    image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
+    # Use zeros for text embeddings (shape doesn't matter for FLOP count, only dimensions)
+    encoder_hidden_states = torch.zeros(1, 512, 4096, device=device, dtype=torch.bfloat16)
+    pooled_prompt_embeds = torch.zeros(1, 768, device=device, dtype=torch.bfloat16)
+    text_ids = torch.zeros(1, 512, 3, device=device, dtype=torch.bfloat16)
+    timesteps = torch.full([1], 500, device=device, dtype=torch.long)
+
+    # 1. Calibrate: one FLUX transformer forward pass (sampling)
+    transformer.eval()
+    with tracker.calibrate_sampling():
+        with torch.no_grad():
+            with torch.autocast("cuda", torch.bfloat16):
+                transformer(
+                    hidden_states=z_packed,
+                    encoder_hidden_states=encoder_hidden_states,
+                    timestep=timesteps / 1000,
+                    guidance=torch.tensor([3.5], device=device, dtype=torch.bfloat16),
+                    txt_ids=text_ids.repeat(encoder_hidden_states.shape[1], 1),
+                    pooled_projections=pooled_prompt_embeds,
+                    img_ids=image_ids,
+                    joint_attention_kwargs=None,
+                    return_dict=False,
+                )
+
+    # 2. Calibrate: VAE decode
+    latent_for_vae = torch.randn(1, IN_CHANNELS, latent_h, latent_w, device=device, dtype=torch.bfloat16)
+    vae.enable_tiling()
+    with tracker.calibrate_vae_decode():
+        with torch.inference_mode():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                vae.decode(latent_for_vae, return_dict=False)
+
+    # 3. Calibrate: reward model forward
+    if args.use_hpsv2 and reward_model is not None:
+        dummy_image = torch.randn(1, 3, 224, 224, device=device)
+        dummy_text = tokenizer(["a photo"]).to(device=device)
+        with tracker.calibrate_reward():
+            with torch.no_grad():
+                with torch.amp.autocast('cuda'):
+                    reward_model(dummy_image, dummy_text)
+
+    # 4. Calibrate: one GRPO training step (fwd + bwd)
+    transformer.train()
+    with tracker.calibrate_training():
+        with torch.autocast("cuda", torch.bfloat16):
+            pred = transformer(
+                hidden_states=z_packed,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timesteps / 1000,
+                guidance=torch.tensor([3.5], device=device, dtype=torch.bfloat16),
+                txt_ids=text_ids.repeat(encoder_hidden_states.shape[1], 1),
+                pooled_projections=pooled_prompt_embeds,
+                img_ids=image_ids.squeeze(0),
+                joint_attention_kwargs=None,
+                return_dict=False,
+            )[0]
+        # Simulate backward
+        loss = pred.sum()
+        loss.backward()
+    # Clear gradients from calibration
+    for p in transformer.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+
+    tracker.print_calibration_summary()
+
+
 def main(args):
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -825,6 +909,17 @@ def main(args):
 
     step_times = deque(maxlen=100)
 
+    # --- Compute tracking ---
+    compute_tracker = GRPOComputeTracker(num_gpus=world_size)
+    main_print("--> Calibrating compute tracker (measuring FLOPs with FlopCounterMode)...")
+    calibrate_compute_tracker(
+        compute_tracker, transformer, vae, reward_model, processor,
+        preprocess_val, device, args,
+    )
+    # Per-step operation counts (deterministic from args)
+    num_samples_per_step = args.train_batch_size * (args.num_generations if args.use_group else 1)
+    train_timesteps_per_sample = int((args.sampling_steps - 1) * args.timestep_fraction)
+
     # The number of epochs 1 is a random value; you can also set the number of epochs to be two.
     for epoch in range(1):
         if isinstance(sampler, DistributedSampler):
@@ -843,7 +938,7 @@ def main(args):
                 dist.barrier()
             loss, grad_norm = train_one_step(
                 args,
-                device, 
+                device,
                 transformer,
                 vae,
                 reward_model,
@@ -855,11 +950,17 @@ def main(args):
                 args.max_grad_norm,
                 preprocess_val,
             )
-    
+
+            # Record compute for this step
+            compute_tracker.record_sampling(num_samples_per_step, args.sampling_steps)
+            compute_tracker.record_vae_decode(num_samples_per_step)
+            compute_tracker.record_reward(num_samples_per_step)
+            compute_tracker.record_grpo_training(num_samples_per_step, train_timesteps_per_sample)
+
             step_time = time.time() - start_time
             step_times.append(step_time)
             avg_step_time = sum(step_times) / len(step_times)
-    
+
             progress_bar.set_postfix(
                 {
                     "loss": f"{loss:.4f}",
@@ -869,18 +970,37 @@ def main(args):
             )
             progress_bar.update(1)
             if rank <= 0:
-                wandb.log(
-                    {
+                log_dict = {
                         "train_loss": loss,
                         "learning_rate": lr_scheduler.get_last_lr()[0],
                         "step_time": step_time,
                         "avg_step_time": avg_step_time,
                         "grad_norm": grad_norm,
-                    },
+                    }
+                log_dict.update(compute_tracker.get_metrics())
+                wandb.log(
+                    log_dict,
                     step=step,
                 )
 
 
+
+    # Print final compute summary
+    if rank <= 0:
+        main_print("\n" + "=" * 60)
+        main_print("COMPUTE SUMMARY")
+        main_print("=" * 60)
+        main_print(compute_tracker.summary())
+        # Save to file alongside reward.txt
+        summary_path = os.path.join(args.output_dir, "compute_summary.txt")
+        with open(summary_path, "w") as f:
+            f.write(compute_tracker.summary() + "\n")
+            f.write("\nCalibrated per-operation FLOPs:\n")
+            f.write(f"  sampling_step_flops: {compute_tracker.sampling_step_flops:,}\n")
+            f.write(f"  vae_decode_flops: {compute_tracker.vae_decode_flops:,}\n")
+            f.write(f"  reward_forward_flops: {compute_tracker.reward_forward_flops:,}\n")
+            f.write(f"  training_step_flops: {compute_tracker.training_step_flops:,}\n")
+        main_print(f"--> Compute summary saved to {summary_path}")
 
     if get_sequence_parallel_state():
         destroy_sequence_parallel_group()
