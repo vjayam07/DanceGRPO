@@ -320,7 +320,9 @@ def sample_reference_model(
                 image = vae.decode(latents, return_dict=False)[0]
                 decoded_image = image_processor.postprocess(
                 image)
-        decoded_image[0].save(f"./images/flux_{rank}_{index}.png")
+        images_dir = os.path.join(args.output_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
+        decoded_image[0].save(os.path.join(images_dir, f"flux_{rank}_{index}.png"))
 
         if args.use_hpsv2:
             with torch.no_grad():
@@ -338,7 +340,7 @@ def sample_reference_model(
 
         if args.use_hpsv3:
             with torch.no_grad():
-                hps_score = reward_model.reward([f"./images/flux_{rank}_{index}.png"], [batch_caption[0]])
+                hps_score = reward_model.reward([os.path.join(images_dir, f"flux_{rank}_{index}.png")], [batch_caption[0]])
                 if hps_score.ndim == 2:
                     hps_score = hps_score[:,0]
                 all_rewards.append(hps_score)
@@ -372,7 +374,7 @@ def sample_reference_model(
                     scores = (text_embs @ image_embs.T)[0]
                 
                 return scores
-            pil_images = [Image.open(f"./images/flux_{rank}_{index}.png")]
+            pil_images = [Image.open(os.path.join(images_dir, f"flux_{rank}_{index}.png"))]
             score = calc_probs(tokenizer, reward_model, caption, pil_images, device)
             all_rewards.append(score)
 
@@ -470,7 +472,7 @@ def train_one_step(
     gathered_reward = gather_tensor(samples["rewards"])
     if dist.get_rank()==0:
         print("gathered_reward", gathered_reward)
-        with open('./reward.txt', 'a') as f: 
+        with open(os.path.join(args.output_dir, 'reward.txt'), 'a') as f:
             f.write(f"{gathered_reward.mean().item()}\n")
 
     #计算advantage
@@ -598,7 +600,7 @@ def main(args):
             model_dict = {}
             model, preprocess_train, preprocess_val = create_model_and_transforms(
                 'ViT-H-14',
-                './hps_ckpt/open_clip_pytorch_model.bin',
+                os.path.join(args.hps_ckpt_dir, 'open_clip_pytorch_model.bin'),
                 precision='amp',
                 device=device,
                 jit=False,
@@ -622,7 +624,7 @@ def main(args):
         model = model_dict['model']
         preprocess_val = model_dict['preprocess_val']
         #cp = huggingface_hub.hf_hub_download("xswu/HPSv2", hps_version_map["v2.1"])
-        cp = "./hps_ckpt/HPS_v2.1_compressed.pt"
+        cp = os.path.join(args.hps_ckpt_dir, "HPS_v2.1_compressed.pt")
 
         checkpoint = torch.load(cp, map_location=f'cuda:{device}')
         model.load_state_dict(checkpoint['state_dict'])
@@ -911,6 +913,7 @@ if __name__ == "__main__":
     parser.add_argument("--dit_model_name_or_path", type=str, default=None)
     parser.add_argument("--vae_model_path", type=str, default=None, help="vae model.")
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
+    parser.add_argument("--hps_ckpt_dir", type=str, default="./hps_ckpt", help="Directory containing HPSv2 checkpoint files.")
 
     # diffusion setting
     parser.add_argument("--cfg", type=float, default=0.0)

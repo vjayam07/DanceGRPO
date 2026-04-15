@@ -29,9 +29,19 @@ export WANDB_MODE=online
 # Uncomment to disable wandb:
 # export WANDB_DISABLED=true
 
-# --- One-time setup (skip if already done) -----------------------------------
-mkdir -p images
+# --- Storage paths (all saving/logging goes to atlas2) ------------------------
+ATLAS_BASE="/atlas2/u/vjayam/experiments/cfgrl-expo/DanceGRPO"
+OUTPUT_DIR="${ATLAS_BASE}/data/outputs/grpo_baseline_4gpu_a6000"
+DATA_DIR="${ATLAS_BASE}/data"
+CACHE_DIR="${ATLAS_BASE}/data/.cache"
+HPS_CKPT_DIR="${ATLAS_BASE}/hps_ckpt"
 
+mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${DATA_DIR}/rl_embeddings"
+mkdir -p "${CACHE_DIR}"
+mkdir -p "${HPS_CKPT_DIR}"
+
+# --- One-time setup (skip if already done) -----------------------------------
 # HPSv2 reward model (needed on first run)
 if [ ! -d "HPSv2" ]; then
     echo ">>> Installing HPSv2 reward model..."
@@ -43,10 +53,10 @@ fi
 torchrun --nproc_per_node=4 --master_port 19002 \
     fastvideo/train_grpo_flux_lora.py \
     --seed 42 \
-    --pretrained_model_name_or_path data/flux \
-    --vae_model_path data/flux \
-    --cache_dir data/.cache \
-    --data_json_path data/rl_embeddings/videos2caption.json \
+    --pretrained_model_name_or_path "${DATA_DIR}/flux" \
+    --vae_model_path "${DATA_DIR}/flux" \
+    --cache_dir "${CACHE_DIR}" \
+    --data_json_path "${DATA_DIR}/rl_embeddings/videos2caption.json" \
     --gradient_checkpointing \
     --train_batch_size 1 \
     --num_latent_t 1 \
@@ -60,7 +70,7 @@ torchrun --nproc_per_node=4 --master_port 19002 \
     --checkpointing_steps 50 \
     --allow_tf32 \
     --cfg 0.0 \
-    --output_dir data/outputs/grpo_baseline_4gpu_a6000 \
+    --output_dir "${OUTPUT_DIR}" \
     --h 512 \
     --w 512 \
     --t 1 \
@@ -80,4 +90,5 @@ torchrun --nproc_per_node=4 --master_port 19002 \
     --clip_range 1e-4 \
     --adv_clip_max 5.0 \
     --lora_alpha 256 \
-    --lora_rank 128
+    --lora_rank 128 \
+    --hps_ckpt_dir "${HPS_CKPT_DIR}"
