@@ -34,6 +34,14 @@
 
 set -euo pipefail
 
+# Activate conda environment
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate dancegrpo
+
+# Install flash-attn on GPU node if not already present
+python -c "import flash_attn" 2>/dev/null || \
+  pip install packaging ninja && pip install flash-attn==2.7.0.post2 --no-build-isolation
+
 export WANDB_BASE_URL="https://api.wandb.ai"
 export WANDB_MODE=online
 # Uncomment to disable wandb:
