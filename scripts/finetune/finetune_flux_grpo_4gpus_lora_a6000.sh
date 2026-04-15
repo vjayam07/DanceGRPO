@@ -4,7 +4,7 @@
 #SBATCH --partition=atlas
 #SBATCH --gres=gpu:a6000ada:4
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
+#SBATCH --mem=192G
 #SBATCH --time=72:00:00
 #SBATCH --output=/atlas2/u/vjayam/experiments/cfgrl/logs/slurm/danceGRPO_finetune_%j.out
 #SBATCH --error=/atlas2/u/vjayam/experiments/cfgrl/logs/slurm/danceGRPO_finetune_%j.err

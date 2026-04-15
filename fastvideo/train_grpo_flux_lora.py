@@ -734,7 +734,8 @@ def main(args):
     transformer = FluxTransformer2DModel.from_pretrained(
             args.pretrained_model_name_or_path,
             subfolder="transformer",
-            torch_dtype = torch.float32
+            torch_dtype = torch.float32,
+            low_cpu_mem_usage=True,
     )
 
     from diffusers import FluxPipeline
