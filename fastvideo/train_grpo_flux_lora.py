@@ -653,6 +653,93 @@ def calibrate_compute_tracker(tracker, transformer, vae, reward_model, tokenizer
     tracker.print_calibration_summary()
 
 
+@torch.no_grad()
+def eval_and_log_images(args, transformer, vae, train_dataset, device, step,
+                        eval_seed=42, max_images=9):
+    """Generate images with fixed prompts/noise and log to wandb.
+
+    Mirrors cfgrl-expo's evaluation: same seed resets every eval round so that
+    the same prompts and initial latents are used, enabling apples-to-apples
+    visual comparison across methods.
+    """
+    rank = int(os.environ["RANK"])
+
+    transformer.eval()
+
+    SPATIAL_DOWNSAMPLE = 8
+    IN_CHANNELS = 16
+    latent_h = args.h // SPATIAL_DOWNSAMPLE
+    latent_w = args.w // SPATIAL_DOWNSAMPLE
+
+    # Reset noise generator every eval round (like cfgrl-expo's reset_eval_rng)
+    generator = torch.Generator(device=device).manual_seed(eval_seed)
+
+    # Sigma schedule (same as training)
+    shift = args.shift
+    sigmas = torch.linspace(1, 0, args.sampling_steps + 1, device=device,
+                            dtype=torch.float32)
+    sigmas = sd3_time_shift(shift, sigmas)
+
+    num_eval = min(max_images, len(train_dataset))
+
+    # Phase 1: all ranks run transformer forward (required by FSDP)
+    all_z_packed = []
+    all_captions = []
+    for idx in range(num_eval):
+        prompt_embed, pooled_prompt_embeds, text_ids, caption = train_dataset[idx]
+        prompt_embed = prompt_embed.unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+        pooled_prompt_embeds = pooled_prompt_embeds.unsqueeze(0).to(
+            device=device, dtype=torch.bfloat16)
+        text_ids = text_ids.unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+
+        z = torch.randn(1, IN_CHANNELS, latent_h, latent_w, device=device,
+                        dtype=torch.bfloat16, generator=generator)
+        z_packed = pack_latents(z, 1, IN_CHANNELS, latent_h, latent_w)
+        image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2,
+                                             device, torch.bfloat16)
+
+        # Deterministic Euler sampling (no GRPO exploration noise)
+        for i in range(args.sampling_steps):
+            timestep_value = int(sigmas[i] * 1000)
+            timesteps = torch.full([1], timestep_value, device=device,
+                                   dtype=torch.long)
+            with torch.autocast("cuda", torch.bfloat16):
+                pred = transformer(
+                    hidden_states=z_packed,
+                    encoder_hidden_states=prompt_embed,
+                    timestep=timesteps / 1000,
+                    guidance=torch.tensor([3.5], device=device,
+                                          dtype=torch.bfloat16),
+                    txt_ids=text_ids.repeat(prompt_embed.shape[1], 1),
+                    pooled_projections=pooled_prompt_embeds,
+                    img_ids=image_ids,
+                    joint_attention_kwargs=None,
+                    return_dict=False,
+                )[0]
+            dsigma = sigmas[i + 1] - sigmas[i]
+            z_packed = z_packed + dsigma * pred
+
+        all_z_packed.append(z_packed)
+        all_captions.append(caption)
+
+    # Phase 2: only rank 0 decodes and logs (VAE is not FSDP-wrapped)
+    if rank == 0:
+        vae.enable_tiling()
+        image_processor = VaeImageProcessor(16)
+        wandb_images = []
+        for z_packed, caption in zip(all_z_packed, all_captions):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                latents = unpack_latents(z_packed, args.h, args.w, 8)
+                latents = (latents / 0.3611) + 0.1159
+                image = vae.decode(latents, return_dict=False)[0]
+                decoded = image_processor.postprocess(image)
+            wandb_images.append(wandb.Image(decoded[0], caption=caption[:100]))
+        wandb.log({"evaluation/samples": wandb_images}, step=step)
+
+    transformer.train()
+    dist.barrier()
+
+
 def main(args):
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -896,7 +983,7 @@ def main(args):
         # TODO
 
     progress_bar = tqdm(
-        range(0, 100000),
+        range(0, args.max_train_steps),
         initial=init_steps,
         desc="Steps",
         # Only show the progress bar once on each machine.
@@ -932,13 +1019,19 @@ def main(args):
         # todo future
         for i in range(init_steps+1):
             next(loader)
+        # Log baseline eval images before training starts (step 0)
+        main_print("--> Generating baseline evaluation images...")
+        eval_and_log_images(args, transformer, vae, train_dataset, device,
+                            step=0, eval_seed=args.seed)
+
         for step in range(init_steps+1, args.max_train_steps+1):
             start_time = time.time()
             if step % args.checkpointing_steps == 0:
                 save_lora_checkpoint(transformer, optimizer, rank, args.output_dir,
                                         step, pipe, epoch)
-
-
+                # Log eval images at each checkpoint (cfgrl-expo style)
+                eval_and_log_images(args, transformer, vae, train_dataset,
+                                    device, step=step, eval_seed=args.seed)
                 dist.barrier()
             loss, grad_norm = train_one_step(
                 args,

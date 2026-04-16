@@ -16,17 +16,15 @@
 # Adapted from finetune_flux_grpo_8gpus_lora.sh with the following changes:
 #   - 4 GPUs instead of 8  (nproc_per_node=4)
 #   - 512x512 resolution   (matches cfgrl-expo FLUX setup)
-#   - gradient_accumulation_steps doubled (24 vs 12) to preserve effective batch
+#   - gradient_accumulation_steps = num_generations = 12
 #   - train_batch_size=1 / train_sp_batch_size=1 for memory safety on 48GB
 #   - max_train_steps=300   (sufficient to see reward convergence)
 #   - checkpointing_steps=50
 #
 # Effective batch math (should match the 8-GPU script):
 #   8-GPU:  8 GPUs × batch_size 2 × grad_accum 12 / sp_size 1 = 192
-#   4-GPU:  4 GPUs × batch_size 1 × grad_accum 24 / sp_size 1 =  96
-#   (Halved effective batch — compensated by 2x more accum steps per GPU.
-#    Each GPU processes the same num_generations=12 samples per prompt,
-#    so the GRPO advantage statistics stay comparable.)
+#   4-GPU:  4 GPUs × batch_size 1 × grad_accum 12 / sp_size 1 =  48
+#   (grad_accum must be <= num_generations for the optimizer to step)
 #
 # Reward: HPSv2 (same as cfgrl-expo)
 # Prompts: HPDv2 (./assets/prompts.txt — same source as cfgrl-expo)
@@ -74,7 +72,7 @@ torchrun --nproc_per_node=4 --master_port 19002 \
   --train_sp_batch_size 1 \
   --dataloader_num_workers 4 \
   --gradient_accumulation_steps 12 \
-  --max_train_steps 300 \
+  --max_train_steps 1000 \
   --learning_rate 3e-4 \
   --mixed_precision bf16 \
   --checkpointing_steps 50 \
@@ -84,7 +82,7 @@ torchrun --nproc_per_node=4 --master_port 19002 \
   --h 512 \
   --w 512 \
   --t 1 \
-  --sampling_steps 12 \
+  --sampling_steps 8 \
   --eta 0.3 \
   --lr_warmup_steps 0 \
   --sampler_seed 1223627 \
