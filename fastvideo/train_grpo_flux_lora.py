@@ -584,10 +584,12 @@ def calibrate_compute_tracker(tracker, transformer, vae, reward_model, tokenizer
     z = torch.randn(1, IN_CHANNELS, latent_h, latent_w, device=device, dtype=torch.bfloat16)
     z_packed = pack_latents(z, 1, IN_CHANNELS, latent_h, latent_w)
     image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
-    # Use zeros for text embeddings (shape doesn't matter for FLOP count, only dimensions)
+    # Use zeros for text embeddings matching actual data shapes
     encoder_hidden_states = torch.zeros(1, 512, 4096, device=device, dtype=torch.bfloat16)
     pooled_prompt_embeds = torch.zeros(1, 768, device=device, dtype=torch.bfloat16)
-    text_ids = torch.zeros(1, 512, 3, device=device, dtype=torch.bfloat16)
+    # In the actual pipeline, each saved text_ids is [3] (one row of zeros),
+    # collated to [B, 3]. The .repeat(seq_len, 1) expands it to [seq_len, 3].
+    text_ids = torch.zeros(1, 3, device=device, dtype=torch.bfloat16)
     timesteps = torch.full([1], 500, device=device, dtype=torch.long)
 
     # 1. Calibrate: one FLUX transformer forward pass (sampling)
@@ -600,7 +602,7 @@ def calibrate_compute_tracker(tracker, transformer, vae, reward_model, tokenizer
                     encoder_hidden_states=encoder_hidden_states,
                     timestep=timesteps / 1000,
                     guidance=torch.tensor([3.5], device=device, dtype=torch.bfloat16),
-                    txt_ids=text_ids.repeat(1, encoder_hidden_states.shape[1], 1),
+                    txt_ids=text_ids.repeat(encoder_hidden_states.shape[1], 1),
                     pooled_projections=pooled_prompt_embeds,
                     img_ids=image_ids,
                     joint_attention_kwargs=None,
@@ -633,7 +635,7 @@ def calibrate_compute_tracker(tracker, transformer, vae, reward_model, tokenizer
                 encoder_hidden_states=encoder_hidden_states,
                 timestep=timesteps / 1000,
                 guidance=torch.tensor([3.5], device=device, dtype=torch.bfloat16),
-                txt_ids=text_ids.repeat(1, encoder_hidden_states.shape[1], 1),
+                txt_ids=text_ids.repeat(encoder_hidden_states.shape[1], 1),
                 pooled_projections=pooled_prompt_embeds,
                 img_ids=image_ids.squeeze(0),
                 joint_attention_kwargs=None,
