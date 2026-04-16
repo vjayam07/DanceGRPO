@@ -515,6 +515,7 @@ def train_one_step(
         dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
     ]
     train_timesteps = int(len(samples["timesteps"][0])*args.timestep_fraction)
+    grad_norm = torch.tensor(0.0)
     for i,sample in list(enumerate(samples_batched_list)):
         for _ in range(train_timesteps):
             clip_range = args.clip_range
