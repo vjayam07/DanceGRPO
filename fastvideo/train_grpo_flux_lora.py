@@ -653,16 +653,29 @@ def calibrate_compute_tracker(tracker, transformer, vae, reward_model, tokenizer
     tracker.print_calibration_summary()
 
 
-@torch.no_grad()
-def eval_and_log_images(args, transformer, vae, train_dataset, device, step,
-                        eval_seed=42, max_images=9):
-    """Generate images with fixed prompts/noise and log to wandb.
+def should_checkpoint(step, args):
+    """Variable checkpoint schedule: frequent early, less frequent later."""
+    if args.checkpointing_steps_early is not None:
+        if step <= args.checkpointing_transition_step:
+            return step % args.checkpointing_steps_early == 0
+        else:
+            return step % args.checkpointing_steps_late == 0
+    # Fallback to fixed schedule
+    return step % args.checkpointing_steps == 0
 
-    Mirrors cfgrl-expo's evaluation: same seed resets every eval round so that
-    the same prompts and initial latents are used, enabling apples-to-apples
-    visual comparison across methods.
+
+@torch.no_grad()
+def eval_hpsv2_and_log(args, transformer, vae, full_dataset, device, step,
+                       reward_model, processor, preprocess_val,
+                       eval_dataset_indices, eval_seed=42, num_images_to_log=6):
+    """Distributed HPSv2 evaluation on held-out eval prompts.
+
+    Distributes eval prompts across ranks (FSDP-safe), generates images with
+    deterministic noise, computes HPSv2 reward, and logs mean reward + sample
+    images to wandb.
     """
     rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
 
     transformer.eval()
 
@@ -671,34 +684,41 @@ def eval_and_log_images(args, transformer, vae, train_dataset, device, step,
     latent_h = args.h // SPATIAL_DOWNSAMPLE
     latent_w = args.w // SPATIAL_DOWNSAMPLE
 
-    # Reset noise generator every eval round (like cfgrl-expo's reset_eval_rng)
-    generator = torch.Generator(device=device).manual_seed(eval_seed)
-
-    # Sigma schedule (same as training)
+    # Sigma schedule (deterministic Euler, no GRPO noise)
     shift = args.shift
     sigmas = torch.linspace(1, 0, args.sampling_steps + 1, device=device,
                             dtype=torch.float32)
     sigmas = sd3_time_shift(shift, sigmas)
 
-    num_eval = min(max_images, len(train_dataset))
+    # --- Distribute eval prompts across ranks (pad for FSDP) ---
+    num_eval = len(eval_dataset_indices)
+    per_rank = (num_eval + world_size - 1) // world_size  # ceil division
+    padded_indices = list(eval_dataset_indices) + [eval_dataset_indices[0]] * (per_rank * world_size - num_eval)
+    my_indices = padded_indices[rank * per_rank : (rank + 1) * per_rank]
+    my_real_count = max(0, min(per_rank, num_eval - rank * per_rank))
 
-    # Phase 1: all ranks run transformer forward (required by FSDP)
-    all_z_packed = []
-    all_captions = []
-    for idx in range(num_eval):
-        prompt_embed, pooled_prompt_embeds, text_ids, caption = train_dataset[idx]
+    # --- Phase 1: Generate + decode + score (all ranks run transformer) ---
+    local_hps_scores = []
+    wandb_images = []
+    vae.enable_tiling()
+    image_processor = VaeImageProcessor(16)
+
+    for local_idx, dataset_idx in enumerate(my_indices):
+        prompt_embed, pooled_prompt_embeds, text_ids, caption = full_dataset[dataset_idx]
         prompt_embed = prompt_embed.unsqueeze(0).to(device=device, dtype=torch.bfloat16)
         pooled_prompt_embeds = pooled_prompt_embeds.unsqueeze(0).to(
             device=device, dtype=torch.bfloat16)
         text_ids = text_ids.unsqueeze(0).to(device=device, dtype=torch.bfloat16)
 
+        # Deterministic noise per eval prompt (same across eval rounds)
+        generator = torch.Generator(device=device).manual_seed(eval_seed + dataset_idx)
         z = torch.randn(1, IN_CHANNELS, latent_h, latent_w, device=device,
                         dtype=torch.bfloat16, generator=generator)
         z_packed = pack_latents(z, 1, IN_CHANNELS, latent_h, latent_w)
         image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2,
                                              device, torch.bfloat16)
 
-        # Deterministic Euler sampling (no GRPO exploration noise)
+        # Deterministic Euler sampling
         for i in range(args.sampling_steps):
             timestep_value = int(sigmas[i] * 1000)
             timesteps = torch.full([1], timestep_value, device=device,
@@ -719,22 +739,49 @@ def eval_and_log_images(args, transformer, vae, train_dataset, device, step,
             dsigma = sigmas[i + 1] - sigmas[i]
             z_packed = z_packed + dsigma * pred
 
-        all_z_packed.append(z_packed)
-        all_captions.append(caption)
-
-    # Phase 2: only rank 0 decodes and logs (VAE is not FSDP-wrapped)
-    if rank == 0:
-        vae.enable_tiling()
-        image_processor = VaeImageProcessor(16)
-        wandb_images = []
-        for z_packed, caption in zip(all_z_packed, all_captions):
+        # Decode + HPSv2 only for real prompts (skip padding)
+        if local_idx < my_real_count:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 latents = unpack_latents(z_packed, args.h, args.w, 8)
                 latents = (latents / 0.3611) + 0.1159
                 image = vae.decode(latents, return_dict=False)[0]
                 decoded = image_processor.postprocess(image)
-            wandb_images.append(wandb.Image(decoded[0], caption=caption[:100]))
-        wandb.log({"evaluation/samples": wandb_images}, step=step)
+
+            pil_image = decoded[0]
+            # HPSv2 scoring (same pattern as sample_reference_model)
+            image_tensor = preprocess_val(pil_image).unsqueeze(0).to(
+                device=device, non_blocking=True)
+            text_input = processor([caption]).to(device=device, non_blocking=True)
+            with torch.amp.autocast('cuda'):
+                outputs = reward_model(image_tensor, text_input)
+                image_features = outputs["image_features"]
+                text_features = outputs["text_features"]
+                logits_per_image = image_features @ text_features.T
+                hps_score = torch.diagonal(logits_per_image).item()
+            local_hps_scores.append(hps_score)
+
+            # Collect sample images for wandb (rank 0 only, first few)
+            if rank == 0 and len(wandb_images) < num_images_to_log:
+                wandb_images.append(wandb.Image(
+                    pil_image,
+                    caption=f"HPS={hps_score:.4f} | {caption[:80]}",
+                ))
+
+    # --- Phase 2: All-reduce mean HPSv2 across ranks ---
+    local_sum = torch.tensor(sum(local_hps_scores), device=device, dtype=torch.float32)
+    local_count = torch.tensor(len(local_hps_scores), device=device, dtype=torch.float32)
+    dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
+    mean_hps = (local_sum / local_count).item()
+
+    # --- Phase 3: Log to wandb (rank 0 only) ---
+    if rank == 0:
+        log_dict = {"evaluation/mean_hpsv2_reward": mean_hps}
+        if wandb_images:
+            log_dict["evaluation/samples"] = wandb_images
+        wandb.log(log_dict, step=step)
+
+    main_print(f"[Eval step {step}] Mean HPSv2 over {int(local_count.item())} prompts: {mean_hps:.4f}")
 
     transformer.train()
     dist.barrier()
@@ -932,11 +979,31 @@ def main(args):
         last_epoch=init_steps - 1,
     )
 
-    train_dataset = LatentDataset(args.data_json_path, args.num_latent_t, args.cfg)
+    # --- Train/test split (matching cfgrl-expo: seed=42, 80/20) ---
+    from torch.utils.data import Subset
+    full_dataset = LatentDataset(args.data_json_path, args.num_latent_t, args.cfg)
+    rng_split = np.random.RandomState(args.seed)  # seed=42
+    shuffled = rng_split.permutation(len(full_dataset))
+    split_point = int(len(full_dataset) * 0.8)
+    train_indices = sorted(shuffled[:split_point].tolist())
+    test_indices = sorted(shuffled[split_point:].tolist())
+
+    train_dataset = Subset(full_dataset, train_indices)
+
+    # Select eval prompts from the 20% test pool (seed+1=43, matching cfgrl-expo)
+    rng_eval = np.random.RandomState(args.seed + 1)
+    eval_sample = rng_eval.choice(
+        len(test_indices),
+        size=min(args.num_eval_prompts, len(test_indices)),
+        replace=False,
+    )
+    eval_dataset_indices = [test_indices[i] for i in sorted(eval_sample)]
+    main_print(f"--> Train/test split: {len(train_indices)} train, {len(test_indices)} test")
+    main_print(f"--> Selected {len(eval_dataset_indices)} eval prompts from test pool")
+
     sampler = DistributedSampler(
             train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
         )
-    
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -947,8 +1014,6 @@ def main(args):
         num_workers=args.dataloader_num_workers,
         drop_last=True,
     )
-
-    #vae.enable_tiling()
 
     if rank <= 0:
         project = "flux"
@@ -962,7 +1027,7 @@ def main(args):
         * args.train_sp_batch_size
     )
     main_print("***** Running training *****")
-    main_print(f"  Num examples = {len(train_dataset)}")
+    main_print(f"  Num examples = {len(train_dataset)} (from {len(full_dataset)} total)")
     main_print(f"  Dataloader size = {len(train_dataloader)}")
     main_print(f"  Resume training from step {init_steps}")
     main_print(f"  Instantaneous batch size per device = {args.train_batch_size}")
@@ -1019,19 +1084,27 @@ def main(args):
         # todo future
         for i in range(init_steps+1):
             next(loader)
-        # Log baseline eval images before training starts (step 0)
-        main_print("--> Generating baseline evaluation images...")
-        eval_and_log_images(args, transformer, vae, train_dataset, device,
-                            step=0, eval_seed=args.seed)
+        # Baseline HPSv2 eval before training starts (step 0)
+        main_print("--> Running baseline HPSv2 evaluation...")
+        eval_hpsv2_and_log(
+            args, transformer, vae, full_dataset, device, step=0,
+            reward_model=reward_model, processor=processor,
+            preprocess_val=preprocess_val, eval_dataset_indices=eval_dataset_indices,
+            eval_seed=args.seed,
+        )
 
         for step in range(init_steps+1, args.max_train_steps+1):
             start_time = time.time()
-            if step % args.checkpointing_steps == 0:
+            if should_checkpoint(step, args):
                 save_lora_checkpoint(transformer, optimizer, rank, args.output_dir,
                                         step, pipe, epoch)
-                # Log eval images at each checkpoint (cfgrl-expo style)
-                eval_and_log_images(args, transformer, vae, train_dataset,
-                                    device, step=step, eval_seed=args.seed)
+                eval_hpsv2_and_log(
+                    args, transformer, vae, full_dataset, device, step=step,
+                    reward_model=reward_model, processor=processor,
+                    preprocess_val=preprocess_val,
+                    eval_dataset_indices=eval_dataset_indices,
+                    eval_seed=args.seed,
+                )
                 dist.barrier()
             loss, grad_norm = train_one_step(
                 args,
@@ -1405,8 +1478,23 @@ if __name__ == "__main__":
         ),
     )
 
-
-
+    # Evaluation & variable checkpoint schedule
+    parser.add_argument(
+        "--num_eval_prompts", type=int, default=250,
+        help="Number of held-out eval prompts for HPSv2 evaluation.",
+    )
+    parser.add_argument(
+        "--checkpointing_steps_early", type=int, default=None,
+        help="Checkpoint+eval frequency for steps <= checkpointing_transition_step.",
+    )
+    parser.add_argument(
+        "--checkpointing_transition_step", type=int, default=200,
+        help="Step at which checkpoint frequency switches from early to late.",
+    )
+    parser.add_argument(
+        "--checkpointing_steps_late", type=int, default=50,
+        help="Checkpoint+eval frequency for steps > checkpointing_transition_step.",
+    )
 
     args = parser.parse_args()
     main(args)

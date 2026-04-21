@@ -72,17 +72,20 @@ torchrun --nproc_per_node=4 --master_port 19002 \
   --train_sp_batch_size 1 \
   --dataloader_num_workers 4 \
   --gradient_accumulation_steps 12 \
-  --max_train_steps 50 \
+  --max_train_steps 1000 \
   --learning_rate 3e-4 \
   --mixed_precision bf16 \
-  --checkpointing_steps 10 \
+  --checkpointing_steps_early 10 \
+  --checkpointing_transition_step 200 \
+  --checkpointing_steps_late 50 \
+  --num_eval_prompts 250 \
   --allow_tf32 \
   --cfg 0.0 \
   --output_dir "${OUTPUT_DIR}" \
   --h 512 \
   --w 512 \
   --t 1 \
-  --sampling_steps 8 \
+  --sampling_steps 4 \
   --eta 0.3 \
   --lr_warmup_steps 0 \
   --sampler_seed 1223627 \
