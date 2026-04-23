@@ -42,7 +42,7 @@ export WANDB_MODE=online
 
 # --- Storage paths (all saving/logging goes to atlas2) ------------------------
 ATLAS_BASE="/pscratch/sd/v/vjayam/DanceGRPO"
-OUTPUT_DIR="${ATLAS_BASE}/data/outputs/grpo_baseline_4gpu_a100"
+OUTPUT_DIR="${ATLAS_BASE}/data/outputs/grpo_baseline_4gpu_a100_8step"
 DATA_DIR="${ATLAS_BASE}/data"
 CACHE_DIR="${ATLAS_BASE}/data/.cache"
 HPS_CKPT_DIR="${ATLAS_BASE}/hps_ckpt"
@@ -88,7 +88,7 @@ torchrun --nproc_per_node=4 --master_port 19002 \
   --h 512 \
   --w 512 \
   --t 1 \
-  --sampling_steps 4 \
+  --sampling_steps 8 \
   --eta 0.3 \
   --lr_warmup_steps 0 \
   --sampler_seed 1223627 \
