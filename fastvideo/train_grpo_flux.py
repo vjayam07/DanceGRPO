@@ -638,6 +638,10 @@ def eval_hpsv2_and_log(
     """Evaluate deterministic samples on held-out prompts and log them to W&B."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    main_print(
+        f"--> Starting evaluation at step {step}: "
+        f"{args.eval_episodes} episodes, {args.num_eval_images} W&B images"
+    )
     transformer.eval()
 
     spatial_downsample = 8
@@ -763,14 +767,14 @@ def eval_hpsv2_and_log(
     mean_hps = (local_sum / local_count).item()
 
     if rank == 0:
-        log_dict = {"eval/mean_hpsv2_reward": mean_hps}
+        log_dict = {"evaluation/mean_hpsv2_reward": mean_hps}
         image_samples = [
             sample
             for rank_samples in gathered_image_samples
             for sample in rank_samples
         ][: args.num_eval_images]
         if image_samples:
-            log_dict["eval/samples"] = [
+            log_dict["evaluation/samples"] = [
                 wandb.Image(image, caption=caption)
                 for image, caption in image_samples
             ]
@@ -1027,6 +1031,11 @@ def main(args):
     main_print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     main_print(f"  Total optimization steps per epoch = {args.max_train_steps}")
     main_print(
+        f"  Evaluation = {'enabled' if args.eval_steps > 0 else 'disabled'}"
+        f" (interval={args.eval_steps}, episodes={args.eval_episodes}, "
+        f"images={args.num_eval_images}, at_start={args.eval_at_start})"
+    )
+    main_print(
         f"  Total training parameters per FSDP shard = {sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e9} B"
     )
     # print dtype
@@ -1054,6 +1063,20 @@ def main(args):
     )
 
     step_times = deque(maxlen=100)
+
+    if args.eval_steps > 0 and args.eval_at_start:
+        eval_hpsv2_and_log(
+            args,
+            transformer,
+            vae,
+            full_dataset,
+            device,
+            0,
+            reward_model,
+            processor,
+            preprocess_val,
+            eval_dataset_indices,
+        )
 
     # The number of epochs 1 is a random value; you can also set the number of epochs to be two.
     for epoch in range(1):
@@ -1215,6 +1238,11 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Run held-out HPSv2 evaluation every X training steps. Disabled when 0.",
+    )
+    parser.add_argument(
+        "--eval_at_start",
+        action="store_true",
+        help="Run evaluation once at step 0 before training.",
     )
     parser.add_argument(
         "--num_train_prompts",

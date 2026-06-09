@@ -56,6 +56,8 @@ for checkpoint in open_clip_pytorch_model.bin HPS_v2.1_compressed.pt; do
   fi
 done
 
+echo "Evaluation enabled: step 0 and every ${EVAL_STEPS} steps; ${EVAL_EPISODES} episodes; ${NUM_EVAL_IMAGES} W&B images"
+
 torchrun --nproc_per_node=4 --master_port 19002 \
   fastvideo/train_grpo_flux.py \
   --seed 42 \
@@ -77,6 +79,7 @@ torchrun --nproc_per_node=4 --master_port 19002 \
   --fsdp_sharding_startegy full \
   --checkpointing_steps 50 \
   --eval_steps "${EVAL_STEPS}" \
+  --eval_at_start \
   --num_train_prompts "${NUM_TRAIN_PROMPTS}" \
   --num_eval_prompts "${NUM_EVAL_PROMPTS}" \
   --eval_episodes "${EVAL_EPISODES}" \
