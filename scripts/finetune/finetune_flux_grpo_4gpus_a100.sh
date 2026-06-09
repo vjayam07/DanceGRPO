@@ -38,7 +38,9 @@ DATA_DIR="${SCRATCH_BASE}/data"
 CACHE_DIR="${SCRATCH_BASE}/data/.cache"
 HPS_CKPT_DIR="${SCRATCH_BASE}/hps_ckpt"
 EVAL_STEPS="${EVAL_STEPS:-50}"
-NUM_EVAL_PROMPTS="${NUM_EVAL_PROMPTS:-16}"
+NUM_TRAIN_PROMPTS="${NUM_TRAIN_PROMPTS:-75000}"
+NUM_EVAL_PROMPTS="${NUM_EVAL_PROMPTS:-500}"
+EVAL_EPISODES="${EVAL_EPISODES:-100}"
 NUM_EVAL_IMAGES="${NUM_EVAL_IMAGES:-6}"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -53,6 +55,21 @@ for checkpoint in open_clip_pytorch_model.bin HPS_v2.1_compressed.pt; do
     exit 1
   fi
 done
+
+python -c '
+import collections
+import json
+import sys
+
+path, expected_train, expected_eval = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(path) as f:
+    counts = collections.Counter(item.get("split") for item in json.load(f))
+if counts["train"] != expected_train or counts["eval"] != expected_eval:
+    raise SystemExit(
+        f"{path} has train/eval counts {counts}; expected "
+        f"{expected_train} train and {expected_eval} eval. Re-run Flux embedding preprocessing."
+    )
+' "${DATA_DIR}/rl_embeddings/videos2caption.json" "${NUM_TRAIN_PROMPTS}" "${NUM_EVAL_PROMPTS}"
 
 torchrun --nproc_per_node=4 --master_port 19002 \
   fastvideo/train_grpo_flux.py \
@@ -75,7 +92,9 @@ torchrun --nproc_per_node=4 --master_port 19002 \
   --fsdp_sharding_startegy full \
   --checkpointing_steps 50 \
   --eval_steps "${EVAL_STEPS}" \
+  --num_train_prompts "${NUM_TRAIN_PROMPTS}" \
   --num_eval_prompts "${NUM_EVAL_PROMPTS}" \
+  --eval_episodes "${EVAL_EPISODES}" \
   --num_eval_images "${NUM_EVAL_IMAGES}" \
   --eval_seed 42 \
   --allow_tf32 \

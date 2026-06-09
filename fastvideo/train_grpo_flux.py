@@ -649,6 +649,13 @@ def eval_hpsv2_and_log(
     )
     sigmas = sd3_time_shift(args.shift, sigmas)
 
+    eval_rng = np.random.RandomState(args.eval_seed)
+    eval_dataset_indices = [
+        eval_dataset_indices[index]
+        for index in eval_rng.randint(
+            0, len(eval_dataset_indices), size=args.eval_episodes
+        )
+    ]
     num_eval = len(eval_dataset_indices)
     per_rank = math.ceil(num_eval / world_size)
     padded_indices = list(eval_dataset_indices) + [eval_dataset_indices[0]] * (
@@ -921,29 +928,48 @@ def main(args):
     )
 
     full_dataset = LatentDataset(args.data_json_path, args.num_latent_t, args.cfg)
-    eval_dataset_indices = []
-    train_dataset = full_dataset
+    split_labels = [item.get("split") for item in full_dataset.data_anno]
+    has_labeled_split = all(label in {"train", "eval"} for label in split_labels)
+    if has_labeled_split:
+        from torch.utils.data import Subset
+
+        train_indices = [
+            index for index, label in enumerate(split_labels) if label == "train"
+        ]
+        eval_dataset_indices = [
+            index for index, label in enumerate(split_labels) if label == "eval"
+        ]
+        train_dataset = Subset(full_dataset, train_indices)
+        main_print(
+            f"--> Loaded labeled prompt split: {len(train_indices)} train, "
+            f"{len(eval_dataset_indices)} eval"
+        )
+    else:
+        train_dataset = full_dataset
+        eval_dataset_indices = []
+
     if args.eval_steps > 0:
         if not args.use_hpsv2:
             raise ValueError("--eval_steps requires --use_hpsv2")
-        if args.num_eval_prompts <= 0:
-            raise ValueError("--num_eval_prompts must be positive when eval is enabled")
+        if not has_labeled_split:
+            raise ValueError(
+                "Step-based evaluation requires a labeled train/eval prompt split. "
+                "Re-run preprocess_flux_embedding.py with the CFG-RL Expo prompt bank."
+            )
+        if len(train_dataset) != args.num_train_prompts:
+            raise ValueError(
+                f"Expected {args.num_train_prompts} train prompts, "
+                f"found {len(train_dataset)}"
+            )
+        if len(eval_dataset_indices) != args.num_eval_prompts:
+            raise ValueError(
+                f"Expected {args.num_eval_prompts} eval prompts, "
+                f"found {len(eval_dataset_indices)}"
+            )
+        if args.eval_episodes <= 0:
+            raise ValueError("--eval_episodes must be positive when eval is enabled")
         if args.num_eval_images < 0:
             raise ValueError("--num_eval_images cannot be negative")
-        if len(full_dataset) < 2:
-            raise ValueError("Step-based evaluation requires at least two dataset items")
-
-        from torch.utils.data import Subset
-
-        rng = np.random.RandomState(args.eval_seed)
-        shuffled_indices = rng.permutation(len(full_dataset))
-        num_eval = min(args.num_eval_prompts, max(1, len(full_dataset) // 5))
-        eval_dataset_indices = shuffled_indices[:num_eval].tolist()
-        train_dataset = Subset(full_dataset, shuffled_indices[num_eval:].tolist())
-        main_print(
-            f"--> Using {len(train_dataset)} train prompts and "
-            f"{len(eval_dataset_indices)} held-out eval prompts"
-        )
 
     sampler = DistributedSampler(
             train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
@@ -1174,10 +1200,22 @@ if __name__ == "__main__":
         help="Run held-out HPSv2 evaluation every X training steps. Disabled when 0.",
     )
     parser.add_argument(
+        "--num_train_prompts",
+        type=int,
+        default=75000,
+        help="Expected number of labeled training prompts.",
+    )
+    parser.add_argument(
         "--num_eval_prompts",
         type=int,
-        default=16,
-        help="Maximum number of held-out prompts to evaluate.",
+        default=500,
+        help="Expected number of prompts in the labeled held-out eval bank.",
+    )
+    parser.add_argument(
+        "--eval_episodes",
+        type=int,
+        default=100,
+        help="Number of eval-bank prompts sampled with replacement per evaluation.",
     )
     parser.add_argument(
         "--num_eval_images",

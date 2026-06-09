@@ -24,26 +24,74 @@ from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import re
 from diffusers import FluxPipeline
 
-def contains_chinese(text):
-    return bool(re.search(r'[\u4e00-\u9fff]', text))
+
+def load_and_split_prompts(
+    prompt_path,
+    num_train_prompts,
+    num_eval_prompts,
+    prompt_seed,
+    train_test_split,
+):
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        if prompt_path.endswith(".json"):
+            all_prompts = json.load(f)
+        else:
+            all_prompts = f.read().splitlines()
+
+    import numpy as np
+
+    rng_prompts = np.random.RandomState(prompt_seed)
+    shuffled_indices = rng_prompts.permutation(len(all_prompts))
+    split_point = int(len(all_prompts) * train_test_split)
+    train_pool = [all_prompts[i] for i in shuffled_indices[:split_point]]
+    eval_pool = [all_prompts[i] for i in shuffled_indices[split_point:]]
+
+    # CFG-RL Expo uses a separate NumPy RNG seeded with prompt_seed + 1
+    # for sampling from the two pools.
+    rng_sample = np.random.RandomState(prompt_seed + 1)
+    train_indices = rng_sample.choice(
+        len(train_pool),
+        size=min(num_train_prompts, len(train_pool)),
+        replace=False,
+    )
+    eval_indices = rng_sample.choice(
+        len(eval_pool),
+        size=min(num_eval_prompts, len(eval_pool)),
+        replace=False,
+    )
+    train_prompts = [train_pool[i] for i in sorted(train_indices)]
+    eval_prompts = [eval_pool[i] for i in sorted(eval_indices)]
+    return [
+        *[{"caption": prompt, "split": "train"} for prompt in train_prompts],
+        *[{"caption": prompt, "split": "eval"} for prompt in eval_prompts],
+    ]
 
 class T5dataset(Dataset):
     def __init__(
-        self, txt_path, vae_debug,
+        self,
+        txt_path,
+        vae_debug,
+        num_train_prompts,
+        num_eval_prompts,
+        prompt_seed,
+        train_test_split,
     ):
         self.txt_path = txt_path
         self.vae_debug = vae_debug
-        with open(self.txt_path, "r", encoding="utf-8") as f:
-            self.train_dataset = [
-        line for line in f.read().splitlines() if not contains_chinese(line)
-        ][:50000]
+        self.train_dataset = load_and_split_prompts(
+            txt_path,
+            num_train_prompts,
+            num_eval_prompts,
+            prompt_seed,
+            train_test_split,
+        )
 
     def __getitem__(self, idx):
         #import pdb;pdb.set_trace()
-        caption = self.train_dataset[idx]
+        item = self.train_dataset[idx]
+        caption = item["caption"]
         filename = str(idx)
         #length = self.train_dataset[idx]["length"]
         if self.vae_debug:
@@ -56,7 +104,12 @@ class T5dataset(Dataset):
         else:
             latents = []
 
-        return dict(caption=caption, latents=latents, filename=filename)
+        return dict(
+            caption=caption,
+            latents=latents,
+            filename=filename,
+            split=item["split"],
+        )
 
     def __len__(self):
         return len(self.train_dataset)
@@ -80,7 +133,14 @@ def main(args):
     os.makedirs(os.path.join(args.output_dir, "pooled_prompt_embeds"), exist_ok=True)
 
     latents_txt_path = args.prompt_dir
-    train_dataset = T5dataset(latents_txt_path, args.vae_debug)
+    train_dataset = T5dataset(
+        latents_txt_path,
+        args.vae_debug,
+        args.num_train_prompts,
+        args.num_eval_prompts,
+        args.prompt_seed,
+        args.train_test_split,
+    )
     sampler = DistributedSampler(
         train_dataset, rank=local_rank, num_replicas=world_size, shuffle=True
     )
@@ -120,7 +180,8 @@ def main(args):
                         item["prompt_embed_path"] = video_name + ".pt"
                         item["text_ids"] = video_name + ".pt"
                         item["pooled_prompt_embeds_path"] = video_name + ".pt"   
-                        item["caption"] = data["caption"][idx]             
+                        item["caption"] = data["caption"][idx]
+                        item["split"] = data["split"][idx]
                         json_data.append(item)
         except Exception as e:
             print(f"Rank {local_rank} Error: {repr(e)}")
@@ -165,5 +226,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--vae_debug", action="store_true")
     parser.add_argument("--prompt_dir", type=str, default="./empty.txt")
+    parser.add_argument("--num_train_prompts", type=int, default=75000)
+    parser.add_argument("--num_eval_prompts", type=int, default=500)
+    parser.add_argument("--prompt_seed", type=int, default=42)
+    parser.add_argument("--train_test_split", type=float, default=0.8)
     args = parser.parse_args()
     main(args)
