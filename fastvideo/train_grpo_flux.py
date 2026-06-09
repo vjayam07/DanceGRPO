@@ -653,7 +653,7 @@ def main(args):
             model_dict = {}
             model, preprocess_train, preprocess_val = create_model_and_transforms(
                 'ViT-H-14',
-                './hps_ckpt/open_clip_pytorch_model.bin',
+                os.path.join(args.hps_ckpt_dir, 'open_clip_pytorch_model.bin'),
                 precision='amp',
                 device=device,
                 jit=False,
@@ -677,7 +677,7 @@ def main(args):
         model = model_dict['model']
         preprocess_val = model_dict['preprocess_val']
         #cp = huggingface_hub.hf_hub_download("xswu/HPSv2", hps_version_map["v2.1"])
-        cp = "./hps_ckpt/HPS_v2.1_compressed.pt"
+        cp = os.path.join(args.hps_ckpt_dir, "HPS_v2.1_compressed.pt")
 
         checkpoint = torch.load(cp, map_location=f'cuda:{device}')
         model.load_state_dict(checkpoint['state_dict'])
@@ -923,6 +923,7 @@ if __name__ == "__main__":
     parser.add_argument("--dit_model_name_or_path", type=str, default=None)
     parser.add_argument("--vae_model_path", type=str, default=None, help="vae model.")
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
+    parser.add_argument("--hps_ckpt_dir", type=str, default="./hps_ckpt", help="Directory containing HPSv2 checkpoint files.")
 
     # diffusion setting
     parser.add_argument("--ema_decay", type=float, default=0.995)

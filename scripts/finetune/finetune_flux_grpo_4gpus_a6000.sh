@@ -34,10 +34,12 @@ ATLAS_BASE="/atlas2/u/vjayam/experiments/cfgrl-expo/DanceGRPO"
 OUTPUT_DIR="${ATLAS_BASE}/data/outputs/grpo_full_4gpu_a6000"
 DATA_DIR="${ATLAS_BASE}/data"
 CACHE_DIR="${ATLAS_BASE}/data/.cache"
+HPS_CKPT_DIR="${ATLAS_BASE}/hps_ckpt"
 
 mkdir -p "${OUTPUT_DIR}"
 mkdir -p "${DATA_DIR}/rl_embeddings"
 mkdir -p "${CACHE_DIR}"
+mkdir -p "${HPS_CKPT_DIR}"
 
 # HPSv2 reward model (needed on first run)
 if [ ! -d "HPSv2" ]; then
@@ -45,6 +47,14 @@ if [ ! -d "HPSv2" ]; then
   git clone https://github.com/tgxs002/HPSv2.git
   cd HPSv2 && pip install -e . && cd ..
 fi
+
+for checkpoint in open_clip_pytorch_model.bin HPS_v2.1_compressed.pt; do
+  if [ ! -f "${HPS_CKPT_DIR}/${checkpoint}" ]; then
+    echo "Missing HPSv2 checkpoint: ${HPS_CKPT_DIR}/${checkpoint}" >&2
+    echo "Run scripts/setup_baseline_run.sh or download the checkpoint before training." >&2
+    exit 1
+  fi
+done
 
 torchrun --nproc_per_node=4 --master_port 19002 \
   fastvideo/train_grpo_flux.py \
@@ -86,4 +96,5 @@ torchrun --nproc_per_node=4 --master_port 19002 \
   --timestep_fraction 0.6 \
   --init_same_noise \
   --clip_range 1e-4 \
-  --adv_clip_max 5.0
+  --adv_clip_max 5.0 \
+  --hps_ckpt_dir "${HPS_CKPT_DIR}"
