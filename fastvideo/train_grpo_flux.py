@@ -945,23 +945,40 @@ def main(args):
             f"{len(eval_dataset_indices)} eval"
         )
     else:
-        train_dataset = full_dataset
-        eval_dataset_indices = []
+        if args.eval_steps > 0:
+            from torch.utils.data import Subset
+
+            if args.num_eval_prompts <= 0:
+                raise ValueError("--num_eval_prompts must be positive when eval is enabled")
+            if len(full_dataset) <= args.num_eval_prompts:
+                raise ValueError(
+                    f"Dataset has {len(full_dataset)} prompts, which is not enough "
+                    f"to hold out {args.num_eval_prompts} eval prompts"
+                )
+
+            rng = np.random.RandomState(args.eval_seed)
+            shuffled_indices = rng.permutation(len(full_dataset))
+            eval_dataset_indices = shuffled_indices[:args.num_eval_prompts].tolist()
+            train_indices = shuffled_indices[args.num_eval_prompts:].tolist()
+            train_dataset = Subset(full_dataset, train_indices)
+            main_print(
+                f"--> Dataset has no split labels; deterministically holding out "
+                f"{len(eval_dataset_indices)} eval prompts and training on "
+                f"{len(train_indices)} prompts"
+            )
+        else:
+            train_dataset = full_dataset
+            eval_dataset_indices = []
 
     if args.eval_steps > 0:
         if not args.use_hpsv2:
             raise ValueError("--eval_steps requires --use_hpsv2")
-        if not has_labeled_split:
-            raise ValueError(
-                "Step-based evaluation requires a labeled train/eval prompt split. "
-                "Re-run preprocess_flux_embedding.py with the CFG-RL Expo prompt bank."
-            )
-        if len(train_dataset) != args.num_train_prompts:
+        if has_labeled_split and len(train_dataset) != args.num_train_prompts:
             raise ValueError(
                 f"Expected {args.num_train_prompts} train prompts, "
                 f"found {len(train_dataset)}"
             )
-        if len(eval_dataset_indices) != args.num_eval_prompts:
+        if has_labeled_split and len(eval_dataset_indices) != args.num_eval_prompts:
             raise ValueError(
                 f"Expected {args.num_eval_prompts} eval prompts, "
                 f"found {len(eval_dataset_indices)}"
@@ -1203,7 +1220,7 @@ if __name__ == "__main__":
         "--num_train_prompts",
         type=int,
         default=75000,
-        help="Expected number of labeled training prompts.",
+        help="Expected number of training prompts when the dataset has split labels.",
     )
     parser.add_argument(
         "--num_eval_prompts",
