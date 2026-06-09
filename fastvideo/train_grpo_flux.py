@@ -622,6 +622,161 @@ def train_one_step(
     return total_loss, grad_norm.item()
 
 
+@torch.no_grad()
+def eval_hpsv2_and_log(
+    args,
+    transformer,
+    vae,
+    full_dataset,
+    device,
+    step,
+    reward_model,
+    processor,
+    preprocess_val,
+    eval_dataset_indices,
+):
+    """Evaluate deterministic samples on held-out prompts and log them to W&B."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    transformer.eval()
+
+    spatial_downsample = 8
+    in_channels = 16
+    latent_h = args.h // spatial_downsample
+    latent_w = args.w // spatial_downsample
+    sigmas = torch.linspace(
+        1, 0, args.sampling_steps + 1, device=device, dtype=torch.float32
+    )
+    sigmas = sd3_time_shift(args.shift, sigmas)
+
+    num_eval = len(eval_dataset_indices)
+    per_rank = math.ceil(num_eval / world_size)
+    padded_indices = list(eval_dataset_indices) + [eval_dataset_indices[0]] * (
+        per_rank * world_size - num_eval
+    )
+    my_indices = padded_indices[rank * per_rank : (rank + 1) * per_rank]
+    my_real_count = max(0, min(per_rank, num_eval - rank * per_rank))
+
+    local_hps_scores = []
+    local_image_samples = []
+    vae.enable_tiling()
+    image_processor = VaeImageProcessor(16)
+
+    for local_idx, dataset_idx in enumerate(my_indices):
+        prompt_embed, pooled_prompt_embeds, text_ids, caption = full_dataset[dataset_idx]
+        prompt_embed = prompt_embed.unsqueeze(0).to(
+            device=device, dtype=torch.bfloat16
+        )
+        pooled_prompt_embeds = pooled_prompt_embeds.unsqueeze(0).to(
+            device=device, dtype=torch.bfloat16
+        )
+        text_ids = text_ids.unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+
+        generator = torch.Generator(device=device).manual_seed(
+            args.eval_seed + dataset_idx
+        )
+        latents = torch.randn(
+            1,
+            in_channels,
+            latent_h,
+            latent_w,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        latents = pack_latents(
+            latents, 1, in_channels, latent_h, latent_w
+        )
+        image_ids = prepare_latent_image_ids(
+            1, latent_h // 2, latent_w // 2, device, torch.bfloat16
+        )
+
+        for timestep_idx in range(args.sampling_steps):
+            timesteps = torch.full(
+                [1],
+                int(sigmas[timestep_idx] * 1000),
+                device=device,
+                dtype=torch.long,
+            )
+            with torch.autocast("cuda", torch.bfloat16):
+                pred = transformer(
+                    hidden_states=latents,
+                    encoder_hidden_states=prompt_embed,
+                    timestep=timesteps / 1000,
+                    guidance=torch.tensor(
+                        [3.5], device=device, dtype=torch.bfloat16
+                    ),
+                    txt_ids=text_ids.repeat(prompt_embed.shape[1], 1),
+                    pooled_projections=pooled_prompt_embeds,
+                    img_ids=image_ids,
+                    joint_attention_kwargs=None,
+                    return_dict=False,
+                )[0]
+            latents = (
+                latents
+                + (sigmas[timestep_idx + 1] - sigmas[timestep_idx]) * pred
+            )
+
+        if local_idx >= my_real_count:
+            continue
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            unpacked_latents = unpack_latents(latents, args.h, args.w, 8)
+            unpacked_latents = (unpacked_latents / 0.3611) + 0.1159
+            image = vae.decode(unpacked_latents, return_dict=False)[0]
+            pil_image = image_processor.postprocess(image)[0]
+
+        image_tensor = preprocess_val(pil_image).unsqueeze(0).to(
+            device=device, non_blocking=True
+        )
+        text_input = processor([caption]).to(device=device, non_blocking=True)
+        with torch.amp.autocast("cuda"):
+            outputs = reward_model(image_tensor, text_input)
+            hps_score = torch.diagonal(
+                outputs["image_features"] @ outputs["text_features"].T
+            ).item()
+        local_hps_scores.append(hps_score)
+
+        if len(local_image_samples) < args.num_eval_images:
+            local_image_samples.append(
+                (pil_image, f"HPS={hps_score:.4f} | {caption[:120]}")
+            )
+
+    gathered_image_samples = [None] * world_size if rank == 0 else None
+    dist.gather_object(local_image_samples, gathered_image_samples, dst=0)
+
+    local_sum = torch.tensor(
+        sum(local_hps_scores), device=device, dtype=torch.float32
+    )
+    local_count = torch.tensor(
+        len(local_hps_scores), device=device, dtype=torch.float32
+    )
+    dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
+    mean_hps = (local_sum / local_count).item()
+
+    if rank == 0:
+        log_dict = {"eval/mean_hpsv2_reward": mean_hps}
+        image_samples = [
+            sample
+            for rank_samples in gathered_image_samples
+            for sample in rank_samples
+        ][: args.num_eval_images]
+        if image_samples:
+            log_dict["eval/samples"] = [
+                wandb.Image(image, caption=caption)
+                for image, caption in image_samples
+            ]
+        wandb.log(log_dict, step=step)
+
+    main_print(
+        f"[Eval step {step}] Mean HPSv2 over "
+        f"{int(local_count.item())} prompts: {mean_hps:.4f}"
+    )
+    transformer.train()
+    dist.barrier()
+
+
 def main(args):
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -765,7 +920,31 @@ def main(args):
         last_epoch=init_steps - 1,
     )
 
-    train_dataset = LatentDataset(args.data_json_path, args.num_latent_t, args.cfg)
+    full_dataset = LatentDataset(args.data_json_path, args.num_latent_t, args.cfg)
+    eval_dataset_indices = []
+    train_dataset = full_dataset
+    if args.eval_steps > 0:
+        if not args.use_hpsv2:
+            raise ValueError("--eval_steps requires --use_hpsv2")
+        if args.num_eval_prompts <= 0:
+            raise ValueError("--num_eval_prompts must be positive when eval is enabled")
+        if args.num_eval_images < 0:
+            raise ValueError("--num_eval_images cannot be negative")
+        if len(full_dataset) < 2:
+            raise ValueError("Step-based evaluation requires at least two dataset items")
+
+        from torch.utils.data import Subset
+
+        rng = np.random.RandomState(args.eval_seed)
+        shuffled_indices = rng.permutation(len(full_dataset))
+        num_eval = min(args.num_eval_prompts, max(1, len(full_dataset) // 5))
+        eval_dataset_indices = shuffled_indices[:num_eval].tolist()
+        train_dataset = Subset(full_dataset, shuffled_indices[num_eval:].tolist())
+        main_print(
+            f"--> Using {len(train_dataset)} train prompts and "
+            f"{len(eval_dataset_indices)} held-out eval prompts"
+        )
+
     sampler = DistributedSampler(
             train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
         )
@@ -892,6 +1071,19 @@ def main(args):
                     step=step,
                 )
 
+            if args.eval_steps > 0 and step % args.eval_steps == 0:
+                eval_hpsv2_and_log(
+                    args,
+                    transformer,
+                    vae,
+                    full_dataset,
+                    device,
+                    step,
+                    reward_model,
+                    processor,
+                    preprocess_val,
+                    eval_dataset_indices,
+                )
 
 
     if get_sequence_parallel_state():
@@ -974,6 +1166,30 @@ if __name__ == "__main__":
             "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
             " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
         ),
+    )
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=0,
+        help="Run held-out HPSv2 evaluation every X training steps. Disabled when 0.",
+    )
+    parser.add_argument(
+        "--num_eval_prompts",
+        type=int,
+        default=16,
+        help="Maximum number of held-out prompts to evaluate.",
+    )
+    parser.add_argument(
+        "--num_eval_images",
+        type=int,
+        default=6,
+        help="Maximum number of evaluation sample images to log to W&B.",
+    )
+    parser.add_argument(
+        "--eval_seed",
+        type=int,
+        default=42,
+        help="Seed used to select held-out prompts and generate deterministic eval noise.",
     )
 
     # optimizer & scheduler & Training

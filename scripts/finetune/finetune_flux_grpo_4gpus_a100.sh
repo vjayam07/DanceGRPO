@@ -37,6 +37,9 @@ OUTPUT_DIR="${SCRATCH_BASE}/data/outputs/grpo_full_4gpu_a100_4step"
 DATA_DIR="${SCRATCH_BASE}/data"
 CACHE_DIR="${SCRATCH_BASE}/data/.cache"
 HPS_CKPT_DIR="${SCRATCH_BASE}/hps_ckpt"
+EVAL_STEPS="${EVAL_STEPS:-50}"
+NUM_EVAL_PROMPTS="${NUM_EVAL_PROMPTS:-16}"
+NUM_EVAL_IMAGES="${NUM_EVAL_IMAGES:-6}"
 
 mkdir -p "${OUTPUT_DIR}"
 mkdir -p "${DATA_DIR}/rl_embeddings"
@@ -71,6 +74,10 @@ torchrun --nproc_per_node=4 --master_port 19002 \
   --master_weight_type bf16 \
   --fsdp_sharding_startegy full \
   --checkpointing_steps 50 \
+  --eval_steps "${EVAL_STEPS}" \
+  --num_eval_prompts "${NUM_EVAL_PROMPTS}" \
+  --num_eval_images "${NUM_EVAL_IMAGES}" \
+  --eval_seed 42 \
   --allow_tf32 \
   --cfg 0.0 \
   --output_dir "${OUTPUT_DIR}" \
