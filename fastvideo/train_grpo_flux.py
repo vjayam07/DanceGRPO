@@ -382,7 +382,9 @@ def sample_reference_model(
                 image = vae.decode(latents, return_dict=False)[0]
                 decoded_image = image_processor.postprocess(
                 image)
-        decoded_image[0].save(f"./images/flux_{rank}_{index}.png")
+        images_dir = os.path.join(args.output_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
+        decoded_image[0].save(os.path.join(images_dir, f"flux_{rank}_{index}.png"))
 
         if args.use_hpsv2:
             with torch.no_grad():
@@ -427,7 +429,7 @@ def sample_reference_model(
                     scores = (text_embs @ image_embs.T)[0]
                 
                 return scores
-            pil_images = [Image.open(f"./images/flux_{rank}_{index}.png")]
+            pil_images = [Image.open(os.path.join(images_dir, f"flux_{rank}_{index}.png"))]
             score = calc_probs(tokenizer, reward_model, caption, pil_images, device)
             all_rewards.append(score)
 
